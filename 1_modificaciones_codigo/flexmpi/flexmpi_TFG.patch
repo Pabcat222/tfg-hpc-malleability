@@ -1,0 +1,292 @@
+diff --git a/include/defs.h b/include/defs.h
+index 8d04af8..4fe2686 100644
+--- a/include/defs.h
++++ b/include/defs.h
+@@ -98,7 +98,7 @@
+ #define NPACK 10
+ #define PORT  6666
+ #define PORT2 6667
+-#define NUMBER_OPTIONS 100
++#define NUMBER_OPTIONS 256
+ 
+ 
+ /* macros */
+diff --git a/src/lbalance.c b/src/lbalance.c
+index 77e1ed4..67100b9 100644
+--- a/src/lbalance.c
++++ b/src/lbalance.c
+@@ -501,7 +501,7 @@ static void EMPI_LBalance_spawn_sparse (int rank, int size, int newsize, int* ne
+     nnzrecv = (int*) calloc (EMPI_GLOBAL_Data->size, sizeof(int));
+     assert (nnzrecv);
+ 
+-    //set nnz array
++    //set nnz array (local p array: addr_row[0]=0, addr_row[count]=local NNZ)
+     for (n = 0; n < count; n ++) nnz[n] = (addr_row[n+1] - addr_row[n]);
+ 
+     //reduce nnz array
+@@ -753,11 +753,10 @@ static void EMPI_LBalance_remove_dense (int rank, int size, int newsize, int* ne
+ 
+             //set gcount, rp and srp
+             if (EMPI_GLOBAL_lbpolicy == EMPI_LBSTATIC) {
+-                //get partition size
+                 rp[n] = 1;
+-            }
+-            else{    
+-                //get mflops     
++            } else if (EMPI_GLOBAL_lbpolicy == EMPI_LBCOUNTS) {
++                rp[n] = (int)(smonitor[n].count / (smonitor[n].rtime * 1.0E-6));
++            } else {
+                 rp[n] = (int)(smonitor[n].flops/smonitor[n].rtime);
+             }
+             srp += rp[n];
+@@ -885,11 +884,11 @@ static void EMPI_LBalance_remove_sparse (int rank, int size, int newsize, int* n
+ 
+         if (pfound == EMPI_FALSE) {
+ 
+-            //get mflops
+             if (EMPI_GLOBAL_lbpolicy == EMPI_LBSTATIC) {
+                 rp[n] = 1;
+-            }
+-            else{
++            } else if (EMPI_GLOBAL_lbpolicy == EMPI_LBCOUNTS) {
++                rp[n] = (int)(smonitor[n].count / (smonitor[n].rtime * 1.0E-6));
++            } else {
+                 rp[n] = (int)(smonitor[n].flops/smonitor[n].rtime);
+             }
+             srp += rp[n];
+@@ -917,7 +916,7 @@ static void EMPI_LBalance_remove_sparse (int rank, int size, int newsize, int* n
+     nnzrecv = (int*) calloc (EMPI_GLOBAL_Data->size, sizeof(int));
+     assert (nnzrecv);
+ 
+-    //set nnz array
++    //set nnz array (local p array: addr_row[0]=0, addr_row[count]=local NNZ)
+     for (n = 0; n < count; n ++) nnz[n] = (addr_row[n+1] - addr_row[n]);
+ 
+     //reduce nnz array
+@@ -1040,12 +1039,11 @@ static void EMPI_LBalance_remove_fcost (int rank, int size, int newsize, int* ne
+ 
+         if (pfound == EMPI_FALSE) {
+ 
+-            
+             if (EMPI_GLOBAL_lbpolicy == EMPI_LBSTATIC) {
+                 rp[n] = 1;
+-            }
+-            else{  
+-                //get mflops            
++            } else if (EMPI_GLOBAL_lbpolicy == EMPI_LBCOUNTS) {
++                rp[n] = (int)(smonitor[n].count / (smonitor[n].rtime * 1.0E-6));
++            } else {
+                 rp[n] = (int)(smonitor[n].flops/smonitor[n].rtime);
+             }
+             srp += rp[n];
+@@ -1173,8 +1171,8 @@ int EMPI_LBalance (int *rank, int *size, int count, int disp, int *fc, EMPI_Moni
+ 
+     tini = MPI_Wtime();
+ 
+-    //return if flops are ZERO
+-    for (n = 0; n < *size; n ++) if (smonitor[n].flops == 0) return EMPI_ERROR;
++    //return if flops are ZERO (disabled: PAPI may not measure all ranks in Docker/hybrid CPU)
++    //for (n = 0; n < *size; n ++) if (smonitor[n].flops == 0) return EMPI_ERROR;
+ 
+     //evaluate cpu balance
+     cpu_balance = EMPI_evaluate_LB (*size, smonitor, EMPI_TCPU);
+@@ -1182,7 +1180,7 @@ int EMPI_LBalance (int *rank, int *size, int count, int disp, int *fc, EMPI_Moni
+     //evaluate real balance
+     real_balance = EMPI_evaluate_LB (*size, smonitor, EMPI_TREAL);
+ 
+-    if (real_balance == EMPI_BALANCED) {
++    if (real_balance == EMPI_BALANCED && cpu_balance == EMPI_BALANCED) {
+ 
+         //self_adaptation = false
+         if (EMPI_GLOBAL_self_adaptation == EMPI_FALSE) EMPI_GLOBAL_lbalance = EMPI_FALSE;
+@@ -1198,8 +1196,7 @@ int EMPI_LBalance (int *rank, int *size, int count, int disp, int *fc, EMPI_Moni
+ 
+         external_load = EMPI_evaluate_external_load (EMPI_GLOBAL_hmon, EMPI_GLOBAL_hsteps);
+ 
+-    if (((EMPI_GLOBAL_hmon[EMPI_GLOBAL_hpos] == EMPI_DEDICATED) && (cpu_balance == EMPI_UNBALANCED))
+-    || ((external_load == EMPI_BURST) && (cpu_balance == EMPI_UNBALANCED))) {
++    if (cpu_balance == EMPI_UNBALANCED) {
+ 
+         //Tcpu load balance
+         bttype = EMPI_TCPU;
+@@ -1586,7 +1583,7 @@ static int EMPI_LBalance_sparse (int *rank, int *size, int count, int disp, EMPI
+     nnzrecv = (int*) calloc (EMPI_GLOBAL_Data->size, sizeof(int));
+     assert (nnzrecv);
+ 
+-    //set nnz array
++    //set nnz array (local p array: addr_row[0]=0, addr_row[count]=local NNZ)
+     for (n = 0; n < count; n ++) nnz[n] = (addr_row[n+1] - addr_row[n]);
+ 
+     //reduce nnz array
+diff --git a/src/monitor.c b/src/monitor.c
+index fa26b73..3f202e9 100644
+--- a/src/monitor.c
++++ b/src/monitor.c
+@@ -434,8 +434,7 @@ void EMPI_Monitor_init () {
+         
+         
+         //add floating point operations
+-        //if((retval = PAPI_add_event (EMPI_GLOBAL_PAPI_eventSet, PAPI_FP_OPS)) != PAPI_OK ){
+-        if((retval = PAPI_add_event (EMPI_GLOBAL_PAPI_eventSet, PAPI_TOT_INS)) != PAPI_OK ){
++        if((retval = PAPI_add_event (EMPI_GLOBAL_PAPI_eventSet, PAPI_FP_OPS)) != PAPI_OK ){
+            printf("Monitoring: Error adding event 1\n");
+             switch(retval){
+                 case PAPI_EINVAL:
+@@ -858,7 +857,7 @@ void EMPI_Monitor_end (int *rank, int *size, int iter, int maxiter, int *count,
+ 
+                 if ((EMPI_GLOBAL_allocation == EMPI_NNZ)||(EMPI_GLOBAL_allocation == EMPI_FCOST)) {
+ 
+-                    //get nnz count
++                    //get nnz count (local p array: p[0]=0, p[count]=local NNZ)
+                     EMPI_Get_addr_sparse (EMPI_GLOBAL_Data->id, (void*)&addr_row, (void*)&addr_col, (void*)&addr_val);
+                     monitor.count = addr_row[*count];
+ 
+@@ -1204,7 +1203,7 @@ void EMPI_Monitor_end (int *rank, int *size, int iter, int maxiter, int *count,
+ 
+                 if ((EMPI_GLOBAL_allocation == EMPI_NNZ)||(EMPI_GLOBAL_allocation == EMPI_FCOST)) {
+ 
+-                    //get nnz count
++                    //get nnz count (local p array: p[0]=0, p[count]=local NNZ)
+                     EMPI_Get_addr_sparse (EMPI_GLOBAL_Data->id, (void*)&addr_row, (void*)&addr_col, (void*)&addr_val);
+                     monitor.count = addr_row[*count];
+ 
+@@ -1240,11 +1239,6 @@ void EMPI_Monitor_end (int *rank, int *size, int iter, int maxiter, int *count,
+             PMPI_Allgather (&monitor, 1, EMPI_Monitor_Datatype, smonitor, 1, EMPI_Monitor_Datatype, EMPI_COMM_WORLD);
+ 
+             //Load balancing
+-            if (*rank == EMPI_root){
+-                printf("\n FLEXMPI->Monitor:: Performing load balance %d \n",(*size));
+-            }
+-            
+-
+             EMPI_LBalance (rank, size, *count, *disp, fc, smonitor);
+                         
+             
+@@ -4206,8 +4200,8 @@ static void EMPI_Monitor_malleability_triggered (int *rank, int *size, int iter,
+         }
+         else{
+             // David
+-            //int lbalance = EMPI_NULL;
+-            //if (EMPI_GLOBAL_lbalance == EMPI_TRUE) lbalance = EMPI_LBalance (rank, size, count, disp, fc, smonitor);
++            int lbalance = EMPI_NULL;
++            if (EMPI_GLOBAL_lbalance == EMPI_TRUE) lbalance = EMPI_LBalance (rank, size, count, disp, fc, smonitor);
+             // David
+         }
+         if (hostid != NULL) free (hostid);
+@@ -4708,6 +4702,14 @@ static void EMPI_Monitor_spawn (int *rank, int *size, int nprocs, int count, int
+             //set mflops of the new spawned processes
+             stflops[n] = class->mflops;
+         }
++
++        // If existing processes have no measured FLOPs (PAPI unavailable in this environment),
++        // fall back to equal distribution across all processes to avoid giving 0 rows to originals.
++        int any_old_zero = 0;
++        for (n = 0; n < *size; n++) if (stflops[n] == 0) { any_old_zero = 1; break; }
++        if (any_old_zero) {
++            for (n = 0; n < (*size + nprocs); n++) stflops[n] = 1;
++        }
+     }
+ 
+     //Bcast estimated flops
+diff --git a/src/server.c b/src/server.c
+index da2153b..094a711 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -216,26 +216,75 @@ int command_listener(void)
+         diep("bind");
+     }
+ 
++    int length = 0;
++    printf("\n  Rank: Ready to receive commands");
++    int offset1 = 4 * 1440;
++    int last_iteration = -1;
++    n = 2; // First node to be spawn (2 already in use)
++    int dN = 0;
++
+     while(1)
+     {
+         memset(buf, 0, EMPI_COMMBUFFSIZE);
+         memset(buf_res, 0, EMPI_COMMBUFFSIZE);
+-        int length = recvfrom(s, buf, EMPI_COMMBUFFSIZE, 0, (struct sockaddr *)&si_other, (socklen_t *)&slen);
++
++        length = 0;
++		
++        length = recvfrom(s, buf, EMPI_COMMBUFFSIZE, 0, (struct sockaddr *)&si_other, (socklen_t *)&slen);
++
+         if (length == -1)
+         {
+             diep("recvfrom()");
+         }
+-        printf("Received packet from %s:%d   Data: %s\n\n", inet_ntoa(si_other.sin_addr), ntohs(si_other.sin_port), buf);
++        printf("Iteration %d  Received packet from %s:%d   Data: %s\n\n",EMPI_GLOBAL_iteration, inet_ntoa(si_other.sin_addr), ntohs(si_other.sin_port), buf);
+ 
+         //truncate message
+         char bufer_cropped [length+2];
+         memset(bufer_cropped, 0, length+2);
+         strncpy(bufer_cropped, buf, length);
+         strcat(bufer_cropped, "\0"); // David: add termination string
++        command.options[0] = malloc(20);
++        command.options[1] = malloc(20);
++	sprintf(command.options[0],"%s",EMPI_GLOBAL_hclasses[n]);
+         //Parse string
+         parse_command(bufer_cropped, &command);
++        if(0 && EMPI_GLOBAL_iteration == 1440){
++                command.command_n = 6;
++                sprintf(command.options[1],"4");
++                printf("\n 1 -> %s",command.options[0]);
++                printf("\n 2 -> %s",command.options[1]);
++        }
++        if(0 && EMPI_GLOBAL_iteration == 1440*3 ){
++                command.command_n = 6;
++                sprintf(command.options[1],"%d",dN);
++                printf("\n 1 -> %s",command.options[0]);
++                printf("\n 2 -> %s",command.options[1]);
++        }
++
++
++	if(0 && EMPI_GLOBAL_iteration == (1440*4)){
++        	command.command_n = 6;
++		sprintf(command.options[1],"-2");
++        	printf("\n 1 -> %s",command.options[0]);
++        	printf("\n 2 -> %s",command.options[1]);
++	}
++
++        if(0 && EMPI_GLOBAL_iteration == (28800-offset1)){
++                command.command_n = 6;
++                sprintf(command.options[1],"6");
++                printf("\n 1 -> %s",command.options[0]);
++                printf("\n 2 -> %s",command.options[1]);
++        }
++
++       if(0 && EMPI_GLOBAL_iteration == 72000){
++                command.command_n = 6;
++                sprintf(command.options[1],"-16");
++                printf("\n 1 -> %s",command.options[0]);
++                printf("\n 2 -> %s",command.options[1]);
++        }
++
+          
+-        printf(" Command number is %d\n", command.command_n);
++        printf(" Command number is %d OP1: %s   OP2: %s\n", command.command_n,command.options[0],command.options[1]);
+         switch(command.command_n)
+         {
+             case 1: //command: 0:policy:t_obj:threshold
+@@ -455,6 +504,7 @@ int command_listener(void)
+                      do
+                      {
+                         for (n = 0; n < EMPI_GLOBAL_nhclasses; n ++) {
++			    //printf("\n XX> %s  - %s - %d \n",EMPI_GLOBAL_hclasses[n],command.options[i],atoi(command.options[i+1]));
+                             if (strcmp (EMPI_GLOBAL_hclasses[n], command.options[i]) == 0 && atoi(command.options[i+1])!=0) {
+                                 EMPI_GLOBAL_nprocs_class[0][n] = atoi(command.options[i+1]); // Delta proc (increment/decrement in the proc number)
+                                 printf(" Command: Create %d processes in compute node: %s \n",EMPI_GLOBAL_nprocs_class[0][n],EMPI_GLOBAL_hclasses[n]);
+@@ -571,8 +621,8 @@ int command_listener(void)
+             default:
+                 break;
+         }
+-       length = sendto(s, buf_res, strlen(buf_res), 0, (struct sockaddr *)&si_other, (socklen_t)slen);
+-       printf("Sent %d bytes as response\n", length);
++       // length = sendto(s, buf_res, strlen(buf_res), 0, (struct sockaddr *)&si_other, (socklen_t)slen);
++       // printf("Sent %d bytes as response\n", length);
+     }
+ 
+     free(buf);

@@ -1,0 +1,283 @@
+--- src.bak2/epidemiology/epidemiology_sync.c	2026-02-16 13:45:37.000000000 +0100
++++ epidemiology/epidemiology_sync.c	2026-07-28 09:25:11.416505132 +0200
+@@ -262,15 +262,29 @@
+ 
+     if (ptype == EMPI_NATIVE) MPI_Barrier (EMPI_COMM_WORLD);
+ 
++
+     char *cEpiCheckpoint = getenv("EPIGRAPH_CHECKPOINT");
+     char *cEpiRestore    = getenv("EPIGRAPH_RESTORE");
+-    int CHECKPOINTDAY = 55;
++    char *cEpiCheckPointDay    = getenv("EPIGRAPH_CHECKPOINTDAY");
++    char *cEpiRestoreDay       = getenv("EPIGRAPH_RESTOREDAY");
++
++    int CHECKPOINTDAY = 0;
++    int RESTOREDAY = 0;
++    if(cEpiCheckpoint != NULL ){
++        assert(cEpiCheckPointDay != NULL);
++	CHECKPOINTDAY = atoi(cEpiCheckPointDay);
++    }
++    if(cEpiRestore != NULL){
++        assert(cEpiRestoreDay != NULL);
++	RESTOREDAY = atoi(cEpiRestoreDay);
++    }
++
+ 
+     // Load system state
+     if(cEpiRestore != NULL) {
+         if (iMyRank == 0) printf("\n Reading state");
+ 
+-        int liCheckTime = 1440 * CHECKPOINTDAY;
++        int liCheckTime = 1440 * RESTOREDAY;
+ 
+         if (iMyRank == 0) printf("\n File A");
+ 
+@@ -319,8 +333,11 @@
+     for (liTimeStamp = iSetTimeStamp; liTimeStamp <= liSimTime; liTimeStamp ++) {
+ 
+         // TRACE GENERATION
+-        liCheckpoint = 1440;
+-        if ((liCheckpoint > 0) && ((liTimeStamp % liCheckpoint) == 0)) {
++        liCheckpoint = MINDAY; // liCheckpoint has to be greater or equal than  MINDAY (to do not interfere with Monitor Init/End)
++	if( liCheckpoint < MINDAY){  
++		liCheckpoint = MINDAY;
++	}
++        if ((liCheckpoint > 0) && ((liTimeStamp % EMPI_GLOBAL_niter_lb) == 0)) {
+ 
+             /* Store CONDITION_TIME array */
+             dLogTimeStamp = MPI_Wtime();
+@@ -329,9 +346,6 @@
+                              iMyRank, liTimeStamp)) != EOF);
+             fflush(flLogfile);
+ 
+-            //StoreCondition(&iArrayCondition, iMyRank, 1, cPathStructure, (int) liTimeStamp, liLimitLow, liLimitUp, liPopSize);
+-
+-
+             if (iMyRank == 0) printf("\n IOTimeStamp %f NumRanks: %d  s: ", dTimeStamp, iNumberProcesses);
+ 
+             StoreStructSingleFile(&((*tpPersonalInfo)[liLimitLow]), iMyRank, 1, cPathStructure, (int) liTimeStamp,
+@@ -339,7 +353,6 @@
+                                   liLimitUp,
+                                   liPopSize, 0);
+ 
+-
+             if (cEpiCheckpoint != NULL && liTimeStamp == 1440 * CHECKPOINTDAY) {
+                 if (iMyRank == 0) printf("\n Checkpointing");
+ 
+@@ -384,118 +397,14 @@
+ 
+             }
+ 
+-
+-            long int index;
+-            if (0) {
+-                int *iTmpArray = (int *) calloc((liLimitUp - liLimitLow + 1), sizeof(int));
+-
+-                ReadSingleFile(iTmpArray, iMyRank, 1, cPathStructure, (int) liTimeStamp, liLimitLow,
+-                               liLimitUp,
+-                               liPopSize);
+-                for (index = 0; index <= (liLimitUp - liLimitLow + 1); index++) {
+-                    if (iArrayCondition[index] != iTmpArray[index])
+-                        printf("\n %d Error iArrayCondition in entry %ld - Val1: %d Val2: %d   [%ld, %ld]", iMyRank,
+-                               index,
+-                               iArrayCondition[index],
+-                               iTmpArray[index], liLimitLow, liLimitUp);
+-                }
+-                free(iTmpArray);
+-            }
+-
+-
+-            if (0) {
+-                int *iTmpArray = (int *) calloc((liLimitUp - liLimitLow + 1), sizeof(int));
+-
+-                ReadSingleFile(iTmpArray, iMyRank, 2, cPathStructure, (int) liTimeStamp, liLimitLow,
+-                               liLimitUp,
+-                               liPopSize);
+-                for (index = 0; index <= (liLimitUp - liLimitLow + 1); index++) {
+-                    if (iArrayConditionTime[index] != iTmpArray[index])
+-                        printf("\n %d Error iArrayConditionTime in entry %ld - Val1: %d Val2: %d   [%ld, %ld]",
+-                               iMyRank, index,
+-                               iArrayConditionTime[index],
+-                               iTmpArray[index], liLimitLow, liLimitUp);
+-                }
+-                free(iTmpArray);
+-            }
+-
+-
+-            if (0) {
+-                int *iTmpArray = (int *) calloc((liLimitUp - liLimitLow + 1), sizeof(int));
+-
+-                ReadSingleFile(iTmpArray, iMyRank, 3, cPathStructure, (int) liTimeStamp, liLimitLow,
+-                               liLimitUp,
+-                               liPopSize);
+-                for (index = 0; index <= (liLimitUp - liLimitLow + 1); index++) {
+-                    if (iBedStatus[index] != iTmpArray[index])
+-                        printf("\n %d Error iBedStatus in entry %ld - Val1: %d Val2: %d   [%ld, %ld]", iMyRank,
+-                               index,
+-                               iBedStatus[index],
+-                               iTmpArray[index], liLimitLow, liLimitUp);
+-                }
+-                free(iTmpArray);
+-            }
+-
+-
+-            if (0) {
+-                int *iTmpArray = (int *) calloc((liLimitUp - liLimitLow + 1), sizeof(int));
+-
+-                ReadSingleFile(iTmpArray, iMyRank, 4, cPathStructure, (int) liTimeStamp, liLimitLow,
+-                               liLimitUp,
+-                               liPopSize);
+-
+-                for (index = 0; index <= (liLimitUp - liLimitLow + 1); index++) {
+-                    if (iArrayInfectedPeople[liLimitLow + index] != iTmpArray[index])
+-                        printf("\n %d Error iArrayInfectedPeople in entry %ld - Val1: %d Val2: %d   [%ld, %ld]",
+-                               iMyRank, index,
+-                               iArrayInfectedPeople[liLimitLow + index],
+-                               iTmpArray[index], liLimitLow, liLimitUp);
+-                }
+-                free(iTmpArray);
+-            }
+-
+-
+-            if (0) {
+-                struct tPersonalInfo *sTmpArray = (struct tPersonalInfo *) calloc((liLimitUp - liLimitLow + 1),
+-                                                                                  sizeof(struct tPersonalInfo));
+-
+-                ReadStructSingleFile(sTmpArray, iMyRank, 1, cPathStructure, (int) liTimeStamp, liLimitLow,
+-                                     liLimitUp,
+-                                     liPopSize);
+-
+-                for (index = 0; index <= (liLimitUp - liLimitLow + 1); index++) {
+-                    if ((*tpPersonalInfo)[index + liLimitLow].age != sTmpArray[index].age)
+-                        printf("\n %d Error iArrayInfectedPeople in entry %ld - Val1: %d Val2: %d   [%ld, %ld]",
+-                               iMyRank, index,
+-                               (*tpPersonalInfo)[index + liLimitLow].age,
+-                               sTmpArray[index].age, liLimitLow, liLimitUp);
+-                }
+-                free(sTmpArray);
+-            }
+-
+-            int iSetTimeStamp;
+-            long int liTmpSimTime;
+-
+-            //ReadState	(iMyRank, cPathStructure, liTimeStamp, &iSetTimeStamp, &liTmpSimTime);
+-
+-
+-            /* Store BED STATUS array */
+-            dLogTimeStamp = MPI_Wtime();
+-            dTimeStamp = dLogTimeStamp - dTimeini;
+-            assert ((fprintf(flLogfile, "[%6.3f \t- ID_%i] FUNCTION: StoreBedStatus at %li secs.\n", dTimeStamp,
+-                             iMyRank, liTimeStamp)) != EOF);
+-            fflush(flLogfile);
+-
+         }
+ 
+         //monitor init
+-        // if ((liTimeStamp % MINDAY) == 0) {
+-        if ((liTimeStamp % MINDAY) == 0) {
++        if ((liTimeStamp % EMPI_GLOBAL_niter_lb) == 0) {
+             EMPI_Monitor_init();
+         }
+ 
+         /* Initial Infectives */
+-
+         if (liTimeStamp == 1440 * 40 && (liTimeStamp % MINDAY) == 0) {
+             InitializeInfectives(iMyRank, &iArrayCondition, RANDOM, 3.0E-2, cPathV, liLimitLow, liLimitUp, liTimeStamp);
+         }
+@@ -531,8 +440,6 @@
+ 
+ 
+         if (0 && (liTimeStamp % 1440) == 0) {
+-            //printf("\n Monitoring2:: %d %d --> %ld %ld",iDay,iMyRank,liLimitLow, liLimitUp);
+-            //if(iMyRank >= 20) assert(0);
+ 
+             dTimeVacum[iMyRank] = dTimeacum;
+             for (i = 0; i < 20; i++) dTimeVacumFinal[i] = 0;
+@@ -542,7 +449,6 @@
+                 char cOutputString1[2048];
+                 char cTmpString[512];
+ 
+-                //sprintf(cOutputString1,"\n Monitoring:: Rank: %-4d \t Day: %-6d \t T: ", iGlobalRank, (int) liTimeStamp / 1440);
+                 sprintf(cOutputString1, "\n Monitoring1:: M%-2d ", (int) liTimeStamp / 1440);
+                 for (i = 0; i < 20; i++) {
+                     sprintf(cTmpString, " %.2f", dTimeVacumFinal[i]);
+@@ -608,20 +514,6 @@
+             }
+         }
+ 
+-        /* MITIGATION STRATEGIES */
+-        /*if ((liTimeStamp % (MINDAY*10)) == 0) {
+-
+-            // Partial infected rate //
+-            dPartInfectedRate = ((iArrayStatProcess[2] + iArrayStatProcess[3] + iArrayStatProcess[4] + iArrayStatProcess[5] + iArrayStatProcess[7] +
+-                                 iArrayStatProcess[10] + iArrayStatProcess[11] + iArrayStatProcess[12] + iArrayStatProcess[14]) / liPopSize);
+-
+-            MPI_Allreduce (&dPartInfectedRate, &dInfectedRate, 1, MPI_DOUBLE, MPI_SUM, EMPI_COMM_WORLD);
+-
+-            // Evaluate mitigation strategies //
+-            if (dInfectedRate > dClosingSchools) iActiveClosingSchools = TRUE;
+-            if (dInfectedRate > dSocialDistancing) iActiveSocialDistancing = TRUE;
+-        }*/
+-
+         prevNumberProcesses = iNumberProcesses;
+ 
+         //Funcion de coste = spread + update;
+--- src.bak2/epigraph_mpi.c	2026-02-16 13:45:37.000000000 +0100
++++ epigraph_mpi.c	2026-07-10 12:08:27.533913123 +0200
+@@ -49,11 +49,25 @@
+ 			,*cPathXML			= NULL
+ 			,*cFileSystem		= NULL
+ 			,*cGraphXML			= NULL
++			,*cPathPrefix		= NULL
+ 			,*cConfigXML		= NULL;
+ 
+ 	/* MPI Initialization */
+    	MPI_Init (&argc, &argv);
+ 	
++	/* Centinela para la maleabilidad por spawn: MPI_Comm_spawn serializa el argv
++	 * por PMI-1, que NO admite un argumento vacio (-> "Expecting value after arg2=
++	 * / unable to parse PMI command"). El lanzador pasa "@" como prefijo de rutas
++	 * (argv[2]). CLAVE: NO mutamos argv[2] aqui — FlexMPI reusa el mismo argv del
++	 * proceso para el MPI_Comm_spawn (process.c: EMPI_Spawn_process), asi que si lo
++	 * vaciasemos, el spawn volveria a serializar un arg vacio y PMI fallaria igual.
++	 * En su lugar mapeamos "@"->"" en un puntero LOCAL (cPathPrefix) que se usa para
++	 * construir las rutas, dejando argv[2]="@" intacto para que el spawn lo serialice
++	 * (no vacio -> PMI OK). Los hijos spawneados reciben argv[2]="@" y repiten este
++	 * mismo mapeo tras su MPI_Init. Ver install-src/lanza_multinodo_spawn.sh. */
++	if (argc >= 3)
++		cPathPrefix = (strcmp (argv[2], "@") == 0) ? "" : argv[2];
++
+ 	/* MPI process rank */
+ 	MPI_Comm_rank (EMPI_COMM_WORLD, &iMyRank);
+ 	
+@@ -76,16 +90,16 @@
+     /* Get the XML configuration files path */
+ 	if (argc >= 3) {
+ 
+-		assert ((cPathXML = (char *) malloc ((strlen((const char *) argv[2])+40) * sizeof (char))) != NULL);
+-		strcpy (cPathXML, (const char *) argv[2]);
+-        strcpy (workdirpath, (const char *) argv[2]);
++		assert ((cPathXML = (char *) malloc ((strlen((const char *) cPathPrefix)+40) * sizeof (char))) != NULL);
++		strcpy (cPathXML, (const char *) cPathPrefix);
++        strcpy (workdirpath, (const char *) cPathPrefix);
+         
+         strcat (cPathXML,"src/data/");
+ 
+-		assert ((cGraphXML = (char *) malloc ((strlen((const char *) argv[2])+50) * sizeof (char))) != NULL);
++		assert ((cGraphXML = (char *) malloc ((strlen((const char *) cPathPrefix)+50) * sizeof (char))) != NULL);
+ 		sprintf (cGraphXML, "%s%s", cPathXML, "XMLGraphConfigFile.xml");
+ 
+-		assert ((cConfigXML = (char *) malloc ((strlen((const char *) argv[2])+30) * sizeof (char))) != NULL);
++		assert ((cConfigXML = (char *) malloc ((strlen((const char *) cPathPrefix)+30) * sizeof (char))) != NULL);
+ 		sprintf (cConfigXML, "%s%s", cPathXML, "XMLConfigFile.xml");
+ 
+ 	} else {
+@@ -209,7 +223,7 @@
+ 	fflush (flLogfile);
+ 
+ 	/* Simulate spreading */
+-	EpiSim (iMyRank, iNumberProcesses, iFileSystem, iList, cConfigXML, cGraphXML, flLogfile, dTimeini, argv[2], argv);
++	EpiSim (iMyRank, iNumberProcesses, iFileSystem, iList, cConfigXML, cGraphXML, flLogfile, dTimeini, cPathPrefix, argv);
+ 
+ 	/* LOGFILE */
+ 	dTimenow = MPI_Wtime();

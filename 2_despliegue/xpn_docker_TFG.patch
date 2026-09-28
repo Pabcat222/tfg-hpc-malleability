@@ -1,0 +1,398 @@
+diff --git a/docker/dockercompose.yml b/docker/dockercompose.yml
+index 383dd81..6ea7524 100755
+--- a/docker/dockercompose.yml
++++ b/docker/dockercompose.yml
+@@ -2,6 +2,9 @@
+ networks:
+   b0:
+     driver: bridge
++    ipam:
++      config:
++        - subnet: 172.28.0.0/16
+ 
+ services:
+   node:
+diff --git a/xpn_docker.sh b/xpn_docker.sh
+index e8d03b9..779e1dc 100755
+--- a/xpn_docker.sh
++++ b/xpn_docker.sh
+@@ -46,9 +46,13 @@ xpn_docker_help_c ()
+         echo "     1) Starting the containers:"
+         echo "        * Single node:"
+         echo "           $0 start       <number of containers>"
+-        echo "        * Multi-node:"
++        echo "        * Multi-node (1 servicio, réplicas repartidas por spread):"
+         echo "           $0 swarm-create <machinefile_path>"
+         echo "           $0 start        <number of containers>"
++        echo "        * Multi-node 2 servicios (EpiGraph en un nodo, XPN en otro):"
++        echo "           $0 swarm-create <machinefile_path>   # head=EpiGraph, resto=XPN"
++        echo "           $0 start        <N_EpiGraph> <N_XPN>"
++        echo "           (nodos configurables: EPIGRAPH_NODE=... XPN_NODE=... $0 start N_APP N_XPN)"
+         echo ""
+         echo "     2) To work with containers:"
+         echo "        * To work within a single container:"
+@@ -77,6 +81,22 @@ xpn_docker_help_c ()
+ # machine file create/remove
+ #
+ 
++# Emite "<hostname_nodo_fisico> <ip_overlay>" por cada tarea Running de un servicio.
++# Usado por el modo distribuido, que necesita saber en QUE nodo fisico esta cada replica.
++xpn_docker_svc_node_ips ()
++{
++        SVC=$1
++        for T in $(docker service ps $SVC -f desired-state=running -q); do
++                NODE_ID=$(docker inspect -f '{{.NodeID}}' $T 2>/dev/null)
++                NODE_NAME=$(docker node inspect -f '{{.Description.Hostname}}' $NODE_ID 2>/dev/null)
++                IP=$(docker inspect -f '{{range .NetworksAttachments}}{{.Addresses}}{{end}}' $T 2>/dev/null \
++                       | sed "s/^\[//g" | awk 'BEGIN {FS="/"} ; {print $1}' | grep '^192\.168\.')
++                if [ -n "$NODE_NAME" ] && [ -n "$IP" ]; then
++                        echo "$NODE_NAME $IP"
++                fi
++        done
++}
++
+ xpn_docker_machines_create ()
+ {
+         # machines_mpi
+@@ -90,6 +110,45 @@ xpn_docker_machines_create ()
+                 docker inspect -f '{{range .NetworksAttachments}}{{.Addresses}}{{end}}' $CONTAINER_ID_LIST | sed "s/^\[//g" | awk 'BEGIN {FS="/"} ; {print $1}' > machines_mpi
+ 
+         fi
++        if [ "$MODE" == "MULTI_NODE_2SVC" ]; then
++                # Escenario 2 servicios: EpiGraph (app) primero, XPN al final, de modo que
++                # lanza_xpn_estatico.sh (head -n N_APP = app, tail -n N_XPN = xpn) asigne bien.
++                # Se filtra a la red overlay backend (192.168.*) para descartar ingress/gwbridge.
++                : > machines_mpi
++                for SVC in ${DOCKER_PREFIX_NAME}_epigraph ${DOCKER_PREFIX_NAME}_xpn; do
++                        for T in $(docker service ps $SVC -f desired-state=running -q); do
++                                docker inspect -f '{{range .NetworksAttachments}}{{.Addresses}}{{end}}' $T \
++                                  | sed "s/^\[//g" | awk 'BEGIN {FS="/"} ; {print $1}' \
++                                  | grep '^192\.168\.'
++                        done >> machines_mpi
++                done
++        fi
++        if [ "$MODE" == "MULTI_NODE_2SVC_DIST" ]; then
++                # Escenario DISTRIBUIDO: ambos servicios repartidos entre los dos nodos.
++                # Igual que 2SVC, app primero y XPN al final (head -n N_APP / tail -n N_XPN),
++                # pero el bloque XPN se INTERCALA por nodo fisico (n1,n3,n1,n3,...) para que
++                # cualquier `tail -n N_XPN` par tome N/2 servidores de CADA nodo. Sin intercalar,
++                # `docker service ps` puede devolver juntos los de un mismo nodo y un barrido
++                # de 2 servidores caeria entero en uno solo, dejando a la mitad de los clientes
++                # sin servidor local -- justo el efecto que el experimento quiere medir.
++                : > machines_mpi
++
++                # app: el orden es indiferente (siempre se toma entero con head -n N_APP)
++                xpn_docker_svc_node_ips ${DOCKER_PREFIX_NAME}_epigraph \
++                  | awk '{print $2}' >> machines_mpi
++
++                # xpn: round-robin entre nodos fisicos
++                xpn_docker_svc_node_ips ${DOCKER_PREFIX_NAME}_xpn \
++                  | awk '{ n[$1]++; ip[$1 SUBSEP n[$1]] = $2;
++                           if (!($1 in seen)) { seen[$1] = 1; order[++k] = $1 } }
++                         END { max = 0;
++                               for (h in n) if (n[h] > max) max = n[h];
++                               for (i = 1; i <= max; i++)
++                                 for (j = 1; j <= k; j++) {
++                                   h = order[j];
++                                   if (i <= n[h]) print ip[h SUBSEP i]
++                                 } }' >> machines_mpi
++        fi
+ 
+         # machines_mpi -> machines_hosts + etc_hosts
+         echo -n "" > machines_hosts
+@@ -126,6 +185,31 @@ xpn_docker_machines_remove ()
+         rm -fr .xpn_docker_worksession
+ }
+ 
++xpn_docker_wait_running ()
++{
++        # Espera (hasta ~2 min) a que ambos servicios del stack 2svc tengan todas
++        # sus réplicas Running, para que las tareas ya tengan IP de overlay antes de
++        # generar machines_mpi. Si no convergen, avisa (probablemente error de mount
++        # o de red overlay: revisar 'docker service ps ... --no-trunc').
++        WR_APP=$1
++        WR_XPN=$2
++        echo "Waiting for tasks to reach Running (epigraph=$WR_APP, xpn=$WR_XPN)..."
++        for _i in $(seq 1 60); do
++            # Solo el "N/M": con max_replicas_per_node, docker anade el sufijo
++            # "(max K per node)" y la comparacion exacta fallaba (falsa alarma).
++            R_APP=$(docker service ls --filter name=${DOCKER_PREFIX_NAME}_epigraph --format '{{.Replicas}}' | awk '{print $1}')
++            R_XPN=$(docker service ls --filter name=${DOCKER_PREFIX_NAME}_xpn --format '{{.Replicas}}' | awk '{print $1}')
++            if [ "$R_APP" = "$WR_APP/$WR_APP" ] && [ "$R_XPN" = "$WR_XPN/$WR_XPN" ]; then
++                echo "All tasks Running (epigraph $R_APP, xpn $R_XPN)."
++                return 0
++            fi
++            sleep 2
++        done
++        echo ": WARNING: tasks did not reach Running in time (epigraph $R_APP, xpn $R_XPN)."
++        echo ":  * Check: docker service ps ${DOCKER_PREFIX_NAME}_epigraph ${DOCKER_PREFIX_NAME}_xpn --no-trunc"
++        return 1
++}
++
+ 
+ #
+ # swarm create/destroy
+@@ -164,8 +248,25 @@ xpn_docker_swarm_create ()
+         tail -n $NWORKERS $MACHINE_FILE > /tmp/machinefile_2
+         HEAD_NODE=$(cat /tmp/machinefile_1)
+ 
++        # advertise-addr: IP del nodo head en la red de datos del clúster.
++        # OJO: `hostname -i` puede devolver VARIAS IPs (bridge docker 172.x, eno1, etc.)
++        # y `docker swarm init` sólo admite una -> "accepts no arguments". Se elige la 10.x
++        # (red de datos compartida con los workers). Sobreescribible con ADVERTISE_ADDR.
++        if [ -n "$ADVERTISE_ADDR" ]; then
++            ADV=$ADVERTISE_ADDR
++        else
++            ADV=$(ssh $HEAD_NODE "ip -o -4 addr show | awk '{print \$4}' | cut -d/ -f1 | grep '^10\\.' | head -n1")
++        fi
++        if [ -z "$ADV" ]; then
++            echo ": Could not determine the swarm advertise-addr on $HEAD_NODE."
++            echo ": * Set it manually, e.g.  ADVERTISE_ADDR=10.0.40.20 $0 swarm-create $MACHINE_FILE"
++            echo ""
++            exit
++        fi
++        echo ": swarm advertise-addr = $ADV"
++
+         # swarm_join
+-        ssh $HEAD_NODE 'docker swarm init --advertise-addr $(hostname -i) | grep "docker swarm join --token"' > /tmp/docker_swarm_join.sh
++        ssh $HEAD_NODE "docker swarm init --advertise-addr $ADV | grep 'docker swarm join --token'" > /tmp/docker_swarm_join.sh
+ 
+         while IFS= read -r host
+         do
+@@ -261,6 +362,7 @@ xpn_docker_start ()
+         HOST_UID_VALUE=$(id -u)
+         HOST_GID_VALUE=$(id -g)
+         N_ELTOS=$1
++        N_XPN=$2          # opcional: si se indica (y hay swarm) -> stack de 2 servicios
+ 
+         # Check params
+         if [ -f .xpn_docker_worksession ]; then
+@@ -275,6 +377,15 @@ xpn_docker_start ()
+         MODE=SINGLE_NODE
+         if [ -f .xpn_docker_swarm ]; then
+             MODE=MULTI_NODE
++            # Con 2º argumento (N_XPN) -> escenario multinodo de 2 servicios (epigraph+xpn)
++            if [ -n "$N_XPN" ]; then
++                MODE=MULTI_NODE_2SVC
++                # DIST=1 -> ambos servicios REPARTIDOS entre los dos nodos fisicos
++                # (EpiGraph distribuido + servidores XPN en ambos nodos).
++                if [ "$DIST" == "1" ]; then
++                    MODE=MULTI_NODE_2SVC_DIST
++                fi
++            fi
+         fi
+ 
+         # single/multi
+@@ -293,8 +404,15 @@ xpn_docker_start ()
+                 # Containers machine file
+                 xpn_docker_machines_create "SINGLE_NODE"
+ 
+-                # Update /etc/hosts on each node
++                # Pin containers to P-cores only (cpu0-7) to avoid PAPI PMU confusion
++                # with hybrid Intel CPUs (P-cores vs E-cores have different PMUs)
+                 CONTAINER_ID_LIST=$(docker ps -f name=docker -q)
++                for C in $CONTAINER_ID_LIST; do
++                    docker update --cpuset-cpus 0-7 $C > /dev/null
++                done
++                echo "Containers pinned to P-cores (cpu0-7)"
++
++                # Update /etc/hosts on each node
+                 for C in $CONTAINER_ID_LIST; do
+                     docker container exec -it $C /work/lab-home/bin/hosts_update.sh
+                 done
+@@ -320,6 +438,70 @@ xpn_docker_start ()
+                 # Containers machine file
+                 xpn_docker_machines_create "MULTI_NODE"
+         fi
++        if [ "$MODE" == "MULTI_NODE_2SVC" ]; then
++
++                # Escenario multinodo de 2 servicios: EpiGraph en un nodo, XPN en otro.
++                echo "Deploying 2-service stack ($N_ELTOS EpiGraph + $N_XPN XPN)..."
++                HOST_UID=$HOST_UID_VALUE HOST_GID=$HOST_GID_VALUE docker stack deploy --compose-file docker/dockerstack_multinodo.yml $DOCKER_PREFIX_NAME
++                if [ $? -gt 0 ]; then
++                    echo ": The docker stack deploy command failed to spin up containers."
++                    echo ""
++                    exit
++                fi
++
++                docker service scale --detach ${DOCKER_PREFIX_NAME}_epigraph=$N_ELTOS ${DOCKER_PREFIX_NAME}_xpn=$N_XPN
++                if [ $? -gt 0 ]; then
++                    echo ": The docker service scale command failed to spin up containers."
++                    echo ""
++                    exit
++                fi
++
++                # Esperar a que las tareas estén Running (con IP de overlay) antes de leer machines_mpi
++                xpn_docker_wait_running $N_ELTOS $N_XPN
++
++                # Containers machine file (app primero, xpn al final)
++                xpn_docker_machines_create "MULTI_NODE_2SVC"
++        fi
++        if [ "$MODE" == "MULTI_NODE_2SVC_DIST" ]; then
++
++                # Escenario DISTRIBUIDO: EpiGraph Y XPN repartidos entre los dos nodos.
++                N_SWARM_NODES=$(docker node ls -q | wc -l)
++                if [ "$N_SWARM_NODES" -lt 2 ]; then
++                    echo ": DIST=1 necesita al menos 2 nodos en el swarm (hay $N_SWARM_NODES)."
++                    echo ""
++                    exit
++                fi
++
++                # Mitad de cada servicio por nodo (techo), para que el 50/50 sea determinista
++                # en vez de dejarlo a la heuristica de reparto de Swarm.
++                MAX_PER_NODE_APP=$(( (N_ELTOS + N_SWARM_NODES - 1) / N_SWARM_NODES ))
++                MAX_PER_NODE_XPN=$(( (N_XPN    + N_SWARM_NODES - 1) / N_SWARM_NODES ))
++
++                echo "Deploying DISTRIBUTED 2-service stack ($N_ELTOS EpiGraph + $N_XPN XPN)..."
++                echo "  reparto entre $N_SWARM_NODES nodos: max $MAX_PER_NODE_APP app + $MAX_PER_NODE_XPN xpn por nodo"
++
++                HOST_UID=$HOST_UID_VALUE HOST_GID=$HOST_GID_VALUE \
++                MAX_PER_NODE_APP=$MAX_PER_NODE_APP MAX_PER_NODE_XPN=$MAX_PER_NODE_XPN \
++                docker stack deploy --compose-file docker/dockerstack_multinodo_dist.yml $DOCKER_PREFIX_NAME
++                if [ $? -gt 0 ]; then
++                    echo ": The docker stack deploy command failed to spin up containers."
++                    echo ""
++                    exit
++                fi
++
++                docker service scale --detach ${DOCKER_PREFIX_NAME}_epigraph=$N_ELTOS ${DOCKER_PREFIX_NAME}_xpn=$N_XPN
++                if [ $? -gt 0 ]; then
++                    echo ": The docker service scale command failed to spin up containers."
++                    echo ""
++                    exit
++                fi
++
++                # Esperar a que las tareas estén Running (con IP de overlay) antes de leer machines_mpi
++                xpn_docker_wait_running $N_ELTOS $N_XPN
++
++                # Containers machine file (app primero, xpn al final e INTERCALADO por nodo)
++                xpn_docker_machines_create "MULTI_NODE_2SVC_DIST"
++        fi
+ }
+ 
+ xpn_docker_reconfigure ()
+@@ -328,11 +510,15 @@ xpn_docker_reconfigure ()
+         HOST_UID_VALUE=$(id -u)
+         HOST_GID_VALUE=$(id -g)
+         N_ELTOS=$1
++        N_XPN=$2          # opcional: si se indica (y hay swarm) -> stack de 2 servicios
+ 
+         # Check swarm active -> multi-node
+         MODE=SINGLE_NODE
+         if [ -f .xpn_docker_swarm ]; then
+             MODE=MULTI_NODE
++            if [ -n "$N_XPN" ]; then
++                MODE=MULTI_NODE_2SVC
++            fi
+         fi
+ 
+         # single/multi
+@@ -378,6 +564,30 @@ xpn_docker_reconfigure ()
+                 # Containers machine file
+                 xpn_docker_machines_create "MULTI_NODE"
+         fi
++        if [ "$MODE" == "MULTI_NODE_2SVC" ]; then
++
++                # Escenario multinodo de 2 servicios: EpiGraph en un nodo, XPN en otro.
++                echo "Deploying 2-service stack ($N_ELTOS EpiGraph + $N_XPN XPN)..."
++                HOST_UID=$HOST_UID_VALUE HOST_GID=$HOST_GID_VALUE docker stack deploy --compose-file docker/dockerstack_multinodo.yml $DOCKER_PREFIX_NAME
++                if [ $? -gt 0 ]; then
++                    echo ": The docker stack deploy command failed to spin up containers."
++                    echo ""
++                    exit
++                fi
++
++                docker service scale --detach ${DOCKER_PREFIX_NAME}_epigraph=$N_ELTOS ${DOCKER_PREFIX_NAME}_xpn=$N_XPN
++                if [ $? -gt 0 ]; then
++                    echo ": The docker service scale command failed to spin up containers."
++                    echo ""
++                    exit
++                fi
++
++                # Esperar a que las tareas estén Running (con IP de overlay) antes de leer machines_mpi
++                xpn_docker_wait_running $N_ELTOS $N_XPN
++
++                # Containers machine file (app primero, xpn al final)
++                xpn_docker_machines_create "MULTI_NODE_2SVC"
++        fi
+ }
+ 
+ xpn_docker_stop ()
+@@ -415,6 +625,26 @@ xpn_docker_stop ()
+                  exit
+              fi
+ 
++        fi
++        # El modo DISTRIBUIDO se para igual que el de 2 servicios: es el mismo stack.
++        if [ "$MODE" == "MULTI_NODE_2SVC" ] || [ "$MODE" == "MULTI_NODE_2SVC_DIST" ]; then
++
++             docker stack rm $DOCKER_PREFIX_NAME
++             if [ $? -gt 0 ]; then
++                 echo ": The 'docker stack rm' command failed to stop the services."
++                 echo ""
++                 exit
++             fi
++
++             # 'docker stack rm' borra la red overlay de forma ASÍNCRONA; un 'start'
++             # inmediato falla con "network ${DOCKER_PREFIX_NAME}_backend not found".
++             # Esperar (hasta ~1 min) a que la red desaparezca del todo.
++             echo "Waiting for overlay network to be removed..."
++             for _i in $(seq 1 30); do
++                 docker network ls --format '{{.Name}}' | grep -q "^${DOCKER_PREFIX_NAME}_backend$" || break
++                 sleep 2
++             done
++
+         fi
+ 
+         # Remove container cluster files...
+@@ -471,6 +701,21 @@ xpn_docker_bash ()
+              docker container exec -it --user lab $CO_NAME /usr/bin/ssh $CO_IP
+ 
+         fi
++        if [ "$MODE" == "MULTI_NODE_2SVC" ]; then
++
++             # Los contenedores de EpiGraph corren en ESTE nodo (head del swarm),
++             # así que se entra con 'docker exec' directo al CO_ID-ésimo de ellos.
++             CO_NAME=$(docker ps -f name=${DOCKER_PREFIX_NAME}_epigraph -q | head -$CO_ID | tail -1)
++             if [ "x$CO_NAME" == "x" ]; then
++                  echo ": No hay contenedor de EpiGraph #$CO_ID en este nodo."
++                  echo ": * ¿Ejecutaste './xpn_docker.sh start <N_APP> <N_XPN>' en este nodo?"
++                  echo ""
++                  exit
++             fi
++             echo "Executing /bin/bash on container $CO_NAME (EpiGraph id: $CO_ID) ..."
++             docker exec -it --user lab $CO_NAME /bin/bash -l
++
++        fi
+ }
+ 
+ 
+@@ -562,16 +807,21 @@ do
+                 # Get parameters
+                 shift
+                 NN=$1
++                NX=$2          # opcional: nº de servidores XPN (escenario multinodo 2 servicios)
++                # consumir NX si viene (NN lo consume el shift final tras 'esac')
++                [ -n "$NX" ] && shift
+ 
+-                xpn_docker_start $NN
++                xpn_docker_start $NN $NX
+              ;;
+ 
+              reconfigure)
+                 # Get parameters
+                 shift
+                 NN=$1
++                NX=$2
++                [ -n "$NX" ] && shift
+ 
+-                xpn_docker_reconfigure $NN
++                xpn_docker_reconfigure $NN $NX
+              ;;
+ 
+              stop)
+@@ -705,4 +955,3 @@ do
+ 
+         shift
+ done
+-

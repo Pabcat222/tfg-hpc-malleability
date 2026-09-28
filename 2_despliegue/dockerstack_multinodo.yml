@@ -1,0 +1,64 @@
+# Stack de DOS servicios para el escenario multinodo (petición de la tutora):
+#   - servicio 'epigraph' -> cómputo EpiGraph, anclado a EPIGRAPH_NODE (por defecto compute-15-1)
+#   - servicio 'xpn'      -> servidores XPN,   anclado a XPN_NODE      (por defecto compute-15-3)
+# La E/S de EpiGraph viaja por la red overlay entre máquinas físicas hasta el servidor XPN remoto.
+#
+# Los nodos se fijan por hostname del swarm; se pueden sobreescribir por entorno:
+#   EPIGRAPH_NODE=compute-15-1 XPN_NODE=compute-15-3 ./xpn_docker.sh start <N_APP> <N_XPN>
+#
+# Ambos servicios arrancan con 0 réplicas; xpn_docker.sh las escala después
+# (docker service scale xpn_docker_epigraph=<N_APP> xpn_docker_xpn=<N_XPN>).
+# Los volúmenes / red / entorno son idénticos al servicio 'node' de dockerstack.yml.
+
+# NOTA: se han QUITADO los mounts node-local del stack single-node (/nvme -> /storage_local,
+# /dev/shm -> /storage_shm, .. -> /storage_backend). Docker Swarm exige que el 'source' del bind
+# exista en CADA nodo y no auto-crea rutas (a diferencia de docker compose); /nvme no existe en los
+# compute-15-x -> "invalid mount config: bind source path does not exist: /nvme". Además el
+# experimento no los usa: XPN escribe su almacén en /tmp/ del contenedor (lanza_xpn_estatico.sh:201,
+# `xpn.sh ... -x /tmp/`), y grep confirma que dockerstart.sh/dockerfile no referencian /storage_*.
+# Se dejan solo los mounts imprescindibles, todos sobre rutas que existen en ambos nodos (NFS home
+# + /lib/modules + docker.sock).
+x-node-common: &node-common
+  image: expandfs/xpn-docker
+  volumes:
+    - type: bind
+      source: ..
+      target: /work
+    - type: bind
+      source: ../export
+      target: /export
+    - type: bind
+      source: /lib/modules
+      target: /lib/modules
+    - type: bind
+      source: ..
+      target: /shared
+    - /var/run/docker.sock:/var/run/docker.sock
+  networks:
+    - backend
+  environment:
+    - HOST_UID=${HOST_UID}
+    - HOST_GID=${HOST_GID}
+
+services:
+  epigraph:
+    <<: *node-common
+    deploy:
+      replicas: 0
+      placement:
+        constraints:
+          - "node.hostname == ${EPIGRAPH_NODE:-compute-15-1}"
+
+  xpn:
+    <<: *node-common
+    deploy:
+      replicas: 0
+      placement:
+        constraints:
+          - "node.hostname == ${XPN_NODE:-compute-15-3}"
+
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: 192.168.0.0/16

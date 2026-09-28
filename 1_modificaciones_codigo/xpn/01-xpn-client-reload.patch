@@ -1,0 +1,146 @@
+--- a/include/xpn_client/xpn/xpn_simple/xpn_init.h
++++ b/include/xpn_client/xpn/xpn_simple/xpn_init.h
+@@ -55,6 +55,12 @@
+      int xpn_simple_destroy ( void );
+      int xpn_simple_init ( void );
+ 
++     /* Reconfiguracion en caliente: relee config.txt y rehace la tabla de
++      * servidores. xpn_reload_if_needed() no hace nada si no esta definida
++      * la variable de entorno XPN_RECONF_FILE. */
++     int  xpn_reload_partition ( void );
++     void xpn_reload_if_needed ( void );
++
+ 
+   /* ................................................................... */
+ 
+--- a/src/xpn_client/xpn/xpn_simple/xpncore/xpn_open.c
++++ b/src/xpn_client/xpn/xpn_simple/xpncore/xpn_open.c
+@@ -191,6 +191,12 @@
+ 
+          XPN_DEBUG_BEGIN_CUSTOM("%s, %d, %d", path, flags, mode);
+ 
++         // Punto unico por el que pasan creat/open: es donde se comprueba si el
++         // almacenamiento se ha reconfigurado y hay que releer config.txt. Se hace
++         // aqui y no en las operaciones de lectura/escritura porque en este punto
++         // el proceso no tiene ninguna operacion en vuelo.
++         xpn_reload_if_needed();
++
+          res = XpnGetAbsolutePath(path, abs_path); // this function generates the absolute path
+          if (res < 0)
+          {
+--- a/src/xpn_client/xpn/xpn_simple/xpncore/xpn_init.c
++++ b/src/xpn_client/xpn/xpn_simple/xpncore/xpn_init.c
+@@ -310,6 +310,113 @@
+ }
+ 
+ 
++/* -------------------------------------------------------------------------
++ * Reconfiguracion en caliente de la tabla de servidores (TFG, 2026-08).
++ *
++ * Expand lee config.txt una sola vez (XpnConfLoad, mas arriba) y no la vuelve
++ * a leer nunca, asi que un proceso vivo conserva para siempre la tabla de
++ * servidores con la que arranco. Eso impide retirar servidores bajo una
++ * aplicacion en marcha: tras un shrink, xpn_shrink deja data_nserv[1] != 0 en
++ * los metadatos del fichero y entonces XpnCheckServAffectedByOp (xpn_open.c)
++ * marca como afectados a TODOS los servidores de la tabla, de modo que el
++ * siguiente open contacta tambien con los que ya no existen.
++ *
++ * xpn_reload_partition() rehace la tabla releyendo config.txt. Se dispara
++ * comparando un contador de generacion que escribe fuera el planificador de
++ * almacenamiento; se usa un contador y no la mtime del fichero porque el
++ * reloj del NFS va desfasado y la mtime no es fiable.
++ *
++ * Sin la variable de entorno XPN_RECONF_FILE el comportamiento es exactamente
++ * el de siempre: xpn_reload_if_needed() retorna sin hacer nada.
++ * ------------------------------------------------------------------------- */
++
++static int xpn_reconf_gen = -1;
++
++int xpn_reload_partition ( void )
++{
++  int i, res;
++
++  pthread_mutex_lock(&xpn_init_mutex);
++
++  if (xpn_initialize == 0)
++  {
++     pthread_mutex_unlock(&xpn_init_mutex);
++     return 0;
++  }
++
++  xpn_destroy_file_table();
++
++  i = 0;
++  while ((i < XPN_MAX_PART) && (xpn_parttable[i].id != -1))
++  {
++     xpn_destroy_servers(&(xpn_parttable[i]));
++     xpn_parttable[i].id = -1;
++     i++;
++  }
++
++  xpn_initialize = 0;
++
++  /* OJO: aqui NO se llama a nfi_worker_destroy(), al contrario que en
++   * xpn_simple_destroy(). Esa funcion destruye global_mt y global_cnd, y
++   * nfi_worker_init() solo los recrea si create_m == 0; create_m es estatico
++   * y ya vale 1, asi que el segundo init trabajaria sobre un mutex destruido. */
++
++  pthread_mutex_unlock(&xpn_init_mutex);
++
++  res = xpn_init_partition();
++
++  return res;
++}
++
++void xpn_reload_if_needed ( void )
++{
++  char  *env_reconf;
++  FILE  *fd;
++  int    gen = -1;
++  int    res;
++  char   hostname[HOST_NAME_MAX];
++
++  env_reconf = getenv("XPN_RECONF_FILE");
++  if ((env_reconf == NULL) || (strlen(env_reconf) == 0)) {
++     return;
++  }
++
++  fd = fopen(env_reconf, "r");
++  if (fd == NULL) {
++     return;
++  }
++  if (fscanf(fd, "%d", &gen) != 1) {
++     gen = -1;
++  }
++  fclose(fd);
++
++  if (gen < 0) {
++     return;
++  }
++
++  /* primera lectura del proceso: solo tomar nota de la generacion vigente */
++  if (xpn_reconf_gen < 0) {
++     xpn_reconf_gen = gen;
++     return;
++  }
++
++  if (gen <= xpn_reconf_gen) {
++     return;
++  }
++
++  xpn_reconf_gen = gen;
++
++  res = xpn_reload_partition();
++
++  /* La traza va a stderr a proposito: queda en el log de la ejecucion, que es
++   * donde se comprueba POR EFECTO que la recarga ocurrio y con cuantos
++   * servidores se quedo. Nada de fiarse de codigos de retorno. */
++  ns_get_hostname(hostname);
++  fprintf(stderr, "[XPN-RELOAD] gen=%d host=%s pid=%d servers=%d rc=%d\n",
++                  gen, hostname, (int)getpid(), xpn_parttable[0].data_nserv, res);
++}
++
++
+ int xpn_simple_init ( void )
+ {
+   return xpn_init_partition();

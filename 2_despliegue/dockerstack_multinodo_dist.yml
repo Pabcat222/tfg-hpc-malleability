@@ -1,0 +1,62 @@
+# Stack de DOS servicios REPARTIDOS entre los dos nodos fisicos (peticion de la tutora,
+# correo 2026-07-28): a diferencia de dockerstack_multinodo.yml -- que ancla 'epigraph' a
+# compute-15-1 y 'xpn' a compute-15-3 -- aqui AMBOS servicios se reparten entre los dos
+# nodos, de modo que EpiGraph se ejecuta distribuido Y cada nodo tiene servidores XPN.
+#
+# El objetivo del experimento es comprobar si Expand aprovecha la localidad de E/S en cada
+# servidor para esquivar el cuello de botella de la red: con servidores en ambos nodos, la
+# fraccion de bloques que cae en el servidor local no cruza el cable.
+#
+#   DIST=1 ./xpn_docker.sh start <N_APP> <N_XPN>
+#
+# El reparto NO se deja a la heuristica de Swarm: max_replicas_per_node fija la mitad de
+# cada servicio en cada nodo, para que el 50/50 sea determinista y la comparativa no quede
+# contaminada por un reparto desigual. xpn_docker.sh calcula esos valores y los inyecta.
+#
+# Ambos servicios arrancan con 0 replicas; xpn_docker.sh las escala despues.
+# Volumenes / red / entorno IDENTICOS a dockerstack_multinodo.yml (misma nota sobre los
+# mounts node-local retirados: Swarm exige que el 'source' del bind exista en CADA nodo).
+
+x-node-common: &node-common
+  image: expandfs/xpn-docker
+  volumes:
+    - type: bind
+      source: ..
+      target: /work
+    - type: bind
+      source: ../export
+      target: /export
+    - type: bind
+      source: /lib/modules
+      target: /lib/modules
+    - type: bind
+      source: ..
+      target: /shared
+    - /var/run/docker.sock:/var/run/docker.sock
+  networks:
+    - backend
+  environment:
+    - HOST_UID=${HOST_UID}
+    - HOST_GID=${HOST_GID}
+
+services:
+  # Sin 'constraints': la ausencia de anclaje es justo lo que permite el reparto.
+  epigraph:
+    <<: *node-common
+    deploy:
+      replicas: 0
+      placement:
+        max_replicas_per_node: ${MAX_PER_NODE_APP:-8}
+
+  xpn:
+    <<: *node-common
+    deploy:
+      replicas: 0
+      placement:
+        max_replicas_per_node: ${MAX_PER_NODE_XPN:-8}
+
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: 192.168.0.0/16
